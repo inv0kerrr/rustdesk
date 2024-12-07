@@ -793,12 +793,13 @@ impl Connection {
                         handle_mouse(&msg, id);
                     }
                     MessageInput::Key((mut msg, press)) => {
-                        // todo: press and down have similar meanings.
-                        if press && msg.mode.enum_value() == Ok(KeyboardMode::Legacy) {
+                        // Set the press state to false, use `down` only in `handle_key()`.
+                        msg.press = false;
+                        if press {
                             msg.down = true;
                         }
                         handle_key(&msg);
-                        if press && msg.mode.enum_value() == Ok(KeyboardMode::Legacy) {
+                        if press {
                             msg.down = false;
                             handle_key(&msg);
                         }
@@ -1371,8 +1372,14 @@ impl Connection {
                 if !self.follow_remote_window {
                     noperms.push(NAME_WINDOW_FOCUS);
                 }
-                if !self.clipboard_enabled()
-                    || !self.peer_keyboard_enabled()
+                // Do not consider the clipboard and keyboard permissions on Android.
+                // Because syncing the clipboard on Android is manually triggered by the user in the floating ball.
+                #[cfg(target_os = "android")]
+                let keyboard_clip_noperm = self.disable_keyboard || self.disable_clipboard;
+                #[cfg(not(target_os = "android"))]
+                let keyboard_clip_noperm =
+                    !self.clipboard_enabled() || !self.peer_keyboard_enabled();
+                if keyboard_clip_noperm
                     || crate::get_builtin_option(keys::OPTION_ONE_WAY_CLIPBOARD_REDIRECTION) == "Y"
                 {
                     noperms.push(super::clipboard_service::NAME);
@@ -1965,8 +1972,6 @@ impl Connection {
                 Some(message::Union::KeyEvent(..)) => {}
                 #[cfg(any(target_os = "android"))]
                 Some(message::Union::KeyEvent(mut me)) => {
-                    let is_press = (me.press || me.down) && !crate::is_modifier(&me);
-
                     let key = match me.mode.enum_value() {
                         Ok(KeyboardMode::Map) => {
                             Some(crate::keyboard::keycode_to_rdev_key(me.chr()))
@@ -1981,6 +1986,9 @@ impl Connection {
                         _ => None,
                     }
                     .filter(crate::keyboard::is_modifier);
+
+                    let is_press =
+                        (me.press || me.down) && !(crate::is_modifier(&me) || key.is_some());
 
                     if let Some(key) = key {
                         if is_press {
@@ -2022,14 +2030,6 @@ impl Connection {
                         }
                         // https://github.com/rustdesk/rustdesk/issues/8633
                         MOUSE_MOVE_TIME.store(get_time(), Ordering::SeqCst);
-                        // handle all down as press
-                        // fix unexpected repeating key on remote linux, seems also fix abnormal alt/shift, which
-                        // make sure all key are released
-                        let is_press = if cfg!(target_os = "linux") {
-                            (me.press || me.down) && !crate::is_modifier(&me)
-                        } else {
-                            me.press
-                        };
 
                         let key = match me.mode.enum_value() {
                             Ok(KeyboardMode::Map) => {
@@ -2045,6 +2045,16 @@ impl Connection {
                             _ => None,
                         }
                         .filter(crate::keyboard::is_modifier);
+
+                        // handle all down as press
+                        // fix unexpected repeating key on remote linux, seems also fix abnormal alt/shift, which
+                        // make sure all key are released
+                        // https://github.com/rustdesk/rustdesk/issues/6793
+                        let is_press = if cfg!(target_os = "linux") {
+                            (me.press || me.down) && !(crate::is_modifier(&me) || key.is_some())
+                        } else {
+                            me.press
+                        };
 
                         if let Some(key) = key {
                             if is_press {
@@ -2149,6 +2159,9 @@ impl Connection {
                             }
                         }
                         match fa.union {
+                            Some(file_action::Union::ReadEmptyDirs(rd)) => {
+                                self.read_empty_dirs(&rd.path, rd.include_hidden);
+                            }
                             Some(file_action::Union::ReadDir(rd)) => {
                                 self.read_dir(&rd.path, rd.include_hidden);
                             }
@@ -3143,6 +3156,14 @@ impl Connection {
         msg_out.set_misc(misc);
         self.send(msg_out).await;
         raii::AuthedConnID::check_remove_session(self.inner.id(), self.session_key());
+    }
+
+    fn read_empty_dirs(&mut self, dir: &str, include_hidden: bool) {
+        let dir = dir.to_string();
+        self.send_fs(ipc::FS::ReadEmptyDirs {
+            dir,
+            include_hidden,
+        });
     }
 
     fn read_dir(&mut self, dir: &str, include_hidden: bool) {
